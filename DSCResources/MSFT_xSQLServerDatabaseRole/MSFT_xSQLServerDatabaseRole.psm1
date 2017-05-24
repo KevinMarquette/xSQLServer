@@ -1,228 +1,377 @@
-$currentPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-Write-Debug -Message "CurrentPath: $currentPath"
+Import-Module -Name (Join-Path -Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) `
+                               -ChildPath 'xSQLServerHelper.psm1') `
+                               -Force
 
-# Load Common Code
-Import-Module $currentPath\..\..\xSQLServerHelper.psm1 -Verbose:$false -ErrorAction Stop
+<#
+    .SYNOPSIS
+    Returns the current state of the user memberships in the role(s).
 
-# DSC resource to manage SQL database roles
-
-# NOTE: This resource requires WMF5 and PsDscRunAsCredential
-
+    .PARAMETER Ensure
+    Specifies the desired state of the membership of the role(s).
+    
+    .PARAMETER Name
+    Specifies the name of the login that evaluated if it is member of the role(s).
+    
+    .PARAMETER SQLServer
+    Specifies the SQL server on which the instance exist.
+    
+    .PARAMETER SQLInstanceName
+    Specifies the SQL instance in which the database exist.
+    
+    .PARAMETER Database
+    Specifies the database in which the login (user) and role(s) exist.
+    
+    .PARAMETER Role
+    Specifies one or more roles to which the login (user) will be evaluated if it should be added or removed.
+#>
 function Get-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Collections.Hashtable])]
     param
     (
-        [ValidateSet("Present","Absent")]
-        [System.String]
-        $Ensure,
-
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLServer = $env:COMPUTERNAME,
+        $SQLServer,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER",
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
-        [System.String]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [System.String[]]
         $Role
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    Write-Verbose -Message "Getting SQL Database role for $Name"
 
-    if($SQL)
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
+
+    if ($sqlServerObject)
     {
         # Check database exists
-        if(!($SQLDatabase = $SQL.Databases[$Database]))
+        if ( -not ($sqlDatabaseObject = $sqlServerObject.Databases[$Database]) )
         {
-            throw New-TerminatingError -ErrorType NoDatabase -FormatArgs @($Database,$SQLServer,$SQLInstanceName) -ErrorCategory ObjectNotFound
+            throw New-TerminatingError -ErrorType NoDatabase `
+                                       -FormatArgs @($Database, $SQLServer, $SQLInstanceName) `
+                                       -ErrorCategory ObjectNotFound
         }
 
         # Check role exists
-        if(!($SQLDatabase.Roles[$Role]))
+        foreach ($currentRole in $Role)
         {
-            throw New-TerminatingError -ErrorType RoleNotFound -FormatArgs @($Role,$Database,$SQLServer,$SQLInstanceName) -ErrorCategory ObjectNotFound
+            if( -not ($sqlDatabaseObject.Roles[$currentRole]) )
+            {
+                throw New-TerminatingError -ErrorType RoleNotFound `
+                                           -FormatArgs @($currentRole, $Database, $SQLServer, $SQLInstanceName) `
+                                           -ErrorCategory ObjectNotFound
+            }
         }
 
         # Check login exists
-        if(!($SQLLogin = $SQL.Logins[$Name]))
+        if ( -not ($sqlServerObject.Logins[$Name]) )
         {
-            throw New-TerminatingError -ErrorType LoginNotFound -FormatArgs @($Name,$SQLServer,$SQLInstanceName) -ErrorCategory ObjectNotFound
+            throw New-TerminatingError -ErrorType LoginNotFound `
+                                       -FormatArgs @($Name, $SQLServer, $SQLInstanceName) `
+                                       -ErrorCategory ObjectNotFound
         }
 
-        if($SQLDatabaseUser = $SQLDatabase.Users[$Name])
+        $ensure = 'Absent'
+        $grantedRole = @()
+
+        if ($sqlDatabaseUser = $sqlDatabaseObject.Users[$Name] )
         {
-            if($SQLDatabaseUser.IsMember($Role))
+            foreach ($currentRole in $Role)
             {
-                Write-Verbose "SQL login $Name is a member of role $Role on database $Database on $SQLServer\$SQLInstanceName"
-                $Ensure = "Present"
+                if ($sqlDatabaseUser.IsMember($currentRole))
+                {
+                    New-VerboseMessage -Message ("The login '$Name' is a member of the role '$currentRole' on the " + `
+                                                 "database '$Database', on the instance $SQLServer\$SQLInstanceName")
+                    
+                    $grantedRole += $currentRole
+                }
+                else
+                {
+                    New-VerboseMessage -Message ("The login '$Name' is not a member of the role '$currentRole' on the " + `
+                                                 "database '$Database', on the instance $SQLServer\$SQLInstanceName")
+                }
             }
-            else
+
+            if ( -not (Compare-Object -ReferenceObject $Role -DifferenceObject $grantedRole) )
             {
-                Write-Verbose "SQL login $Name is not a member of role $Role on database $Database on $SQLServer\$SQLInstanceName"
-                $Ensure = "Absent"
+                $ensure = 'Present'
             }
         }
         else
         {
-            Write-Verbose "SQL login $Name is not a user of database $Database on $SQLServer\$SQLInstanceName"
-            $Ensure = "Absent"
+            New-VerboseMessage -Message ("The login '$Name' is not a user of the database " + `
+                                         "'$Database' on the instance $SQLServer\$SQLInstanceName")
         }
-    }
-    else
-    {
-        $Ensure = "Absent"
     }
 
     $returnValue = @{
-        Ensure = $Ensure
-        Name = $Name
-        SQLServer = $SQLServer
+        Ensure          = $ensure
+        Name            = $Name
+        SQLServer       = $SQLServer
         SQLInstanceName = $SQLInstanceName
-        Database = $Database
-        Role = $Role
+        Database        = $Database
+        Role            = $grantedRole
     }
 
     $returnValue
 }
 
+<#
+    .SYNOPSIS
+    Adds the login (user) to each of the provided roles when Ensure is set to 'Present'.
+    When Ensure is set to 'Absent' the login (user) will be removed from each of the provided roles.
+    If the login does not exist as a user in the database, then the user will be created in the database using the login.
 
+    .PARAMETER Ensure
+    Specifies the desired state of the membership of the role(s).
+    
+    .PARAMETER Name
+    Specifies the name of the login that evaluated if it is member of the role(s), if it is not it will be added.
+    If the login does not exist as a user, a user will be created using the login. 
+    
+    .PARAMETER SQLServer
+    Specifies the SQL server on which the instance exist.
+    
+    .PARAMETER SQLInstanceName
+    Specifies the SQL instance in which the database exist.
+    
+    .PARAMETER Database
+    Specifies the database in which the login (user) and role(s) exist.
+    
+    .PARAMETER Role
+    Specifies one or more roles to which the login (user) will be added or removed.
+#>
 function Set-TargetResource
 {
     [CmdletBinding()]
     param
     (
-        [ValidateSet("Present","Absent")]
+        [Parameter()]
+        [ValidateSet('Present','Absent')]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $Ensure = "Present",
+        $Ensure = 'Present',
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLServer = $env:COMPUTERNAME,
+        $SQLServer,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER",
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
-        [System.String]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [System.String[]]
         $Role
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    Write-Verbose -Message "Setting SQL Database role for $Name"
 
-    if($SQL)
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
+
+    if ($sqlServerObject)
     {
-        $SQLDatabase = $SQL.Databases[$Database]
-        $SQLDatabaseRole = $SQLDatabase.Roles[$Role]
-        switch($Ensure)
+        $sqlDatabaseObject = $sqlServerObject.Databases[$Database]
+        
+        switch ($Ensure)
         {
-            "Present"
+            'Present'
             {
-                if(!$SQLDatabase.Users[$Name])
+                # Adding database user if it does not exist.
+                if ( -not ($sqlDatabaseObject.Users[$Name]) )
                 {
                     try
                     {
-                        Write-Verbose "Adding SQL login $Name as a user of database $Database on $SQLServer\$SQLInstanceName"
-                        $SQLDatabaseUser = New-Object Microsoft.SqlServer.Management.Smo.User $SQLDatabase,$Name
-                        $SQLDatabaseUser.Login = $Name
-                        $SQLDatabaseUser.Create()
+                        New-VerboseMessage -Message ("Adding the login '$Name' as a user of the database " + `
+                                                     "'$Database', on the instance $SQLServer\$SQLInstanceName")
+
+                        $sqlDatabaseUser = New-Object -TypeName Microsoft.SqlServer.Management.Smo.User `
+                                                      -ArgumentList $sqlDatabaseObject, $Name
+                        $sqlDatabaseUser.Login = $Name
+                        $sqlDatabaseUser.Create()
                     }
                     catch
                     {
-                        Write-Verbose "Failed adding SQL login $Name as a user of database $Database on $SQLServer\$SQLInstanceName"
+                        throw New-TerminatingError -ErrorType AddLoginDatabaseSetError `
+                                                   -FormatArgs @($SQLServer,$SQLInstanceName,$Name,$Database) `
+                                                   -ErrorCategory InvalidOperation `
+                                                   -InnerException $_.Exception
                     }
                 }
-                if($SQLDatabase.Users[$Name])
+
+                # Adding database user to the role.
+                foreach ($currentRole in $Role) 
                 {
                     try
                     {
-                        Write-Verbose "Adding SQL login $Name to role $Role on database $Database on $SQLServer\$SQLInstanceName"
-                        $SQLDatabaseRole.AddMember($Name)
+                        New-VerboseMessage -Message ("Adding the login '$Name' to the role '$currentRole' on the " + `
+                                                     "database '$Database', on the instance $SQLServer\$SQLInstanceName")
+
+                        $sqlDatabaseRole = $sqlDatabaseObject.Roles[$currentRole]
+                        $sqlDatabaseRole.AddMember($Name)
                     }
                     catch
                     {
-                        Write-Verbose "Failed adding SQL login $Name to role $Role on database $Database on $SQLServer\$SQLInstanceName"
+                        throw New-TerminatingError -ErrorType AddMemberDatabaseSetError `
+                                                   -FormatArgs @($SQLServer,$SQLInstanceName,$Name,$Role,$Database) `
+                                                   -ErrorCategory InvalidOperation `
+                                                   -InnerException $_.Exception
                     }
                 }
             }
-            "Absent"
+
+            'Absent'
             {
                 try
                 {
-                    Write-Verbose "Removing SQL login $Name from role $Role on database $Database on $SQLServer\$SQLInstanceName"
-                    $SQLDatabaseRole.DropMember($Name)
+                    foreach ($currentRole in $Role) 
+                    {
+                        New-VerboseMessage -Message ("Removing the login '$Name' to the role '$currentRole' on the " + `
+                                                     "database '$Database', on the instance $SQLServer\$SQLInstanceName")
+
+                        $sqlDatabaseRole = $sqlDatabaseObject.Roles[$currentRole]
+                        $sqlDatabaseRole.DropMember($Name)
+                    }
                 }
                 catch
                 {
-                    Write-Verbose "Failed removing SQL login $Name from role $Role on database $Database on $SQLServer\$SQLInstanceName"
+                    throw New-TerminatingError -ErrorType DropMemberDatabaseSetError `
+                                               -FormatArgs @($SQLServer,$SQLInstanceName,$Name,$Role,$Database) `
+                                               -ErrorCategory InvalidOperation `
+                                               -InnerException $_.Exception
                 }
             }
         }
     }
-
-    ### TODO update with localized helper
-    if(!(Test-TargetResource @PSBoundParameters))
-    {
-        throw New-TerminatingError -ErrorType TestFailedAfterSet -ErrorCategory InvalidResult
-    }
 }
 
+<#
+    .SYNOPSIS
+    Tests if the login (user) has the desired state in each of the provided roles.
 
+    .PARAMETER Ensure
+    Specifies the desired state of the membership of the role(s).
+    
+    .PARAMETER Name
+    Specifies the name of the login that evaluated if it is member of the role(s).
+    
+    .PARAMETER SQLServer
+    Specifies the SQL server on which the instance exist.
+    
+    .PARAMETER SQLInstanceName
+    Specifies the SQL instance in which the database exist.
+    
+    .PARAMETER Database
+    Specifies the database in which the login (user) and role(s) exist.
+    
+    .PARAMETER Role
+    Specifies one or more roles to which the login (user) will be tested if it should added or removed.
+#>
 function Test-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Boolean])]
     param
     (
-        [ValidateSet("Present","Absent")]
+        [Parameter()]
+        [ValidateSet('Present','Absent')]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $Ensure = "Present",
+        $Ensure = 'Present',
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLServer = $env:COMPUTERNAME,
+        $SQLServer,
 
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER",
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
-        [System.String]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [System.String[]]
         $Role
     )
 
-    $result = ((Get-TargetResource @PSBoundParameters).Ensure -eq $Ensure)
+    Write-Verbose -Message "Testing SQL Database role for $Name"
     
-    $result
-}
+    $getTargetResourceParameters = @{
+        SQLInstanceName = $PSBoundParameters.SQLInstanceName
+        SQLServer       = $PSBoundParameters.SQLServer
+        Role            = $PSBoundParameters.Role
+        Database        = $PSBoundParameters.Database
+        Name            = $PSBoundParameters.Name
+    }
 
+    $getTargetResourceResult = Get-TargetResource @getTargetResourceParameters
+    
+    $isDatabaseRoleInDesiredState = $true
+    
+    switch ($Ensure)
+    {
+        'Absent'
+        {
+            if ($getTargetResourceResult.Ensure -ne 'Absent')
+            {
+                New-VerboseMessage -Message "Ensure is set to Absent. The existing role for $Name should be dropped"
+                $isDatabaseRoleInDesiredState = $false
+            }
+        }
+        
+        'Present'
+        {
+            if ($getTargetResourceResult.Ensure -ne 'Present')
+            {
+                New-VerboseMessage -Message "Ensure is set to Present. The missing role for $Name should be added"
+                $isDatabaseRoleInDesiredState = $false
+            }
+        }
+    }
+
+    $isDatabaseRoleInDesiredState 
+}
 
 Export-ModuleMember -Function *-TargetResource

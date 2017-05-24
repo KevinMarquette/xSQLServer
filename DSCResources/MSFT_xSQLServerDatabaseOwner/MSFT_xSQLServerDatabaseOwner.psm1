@@ -1,128 +1,208 @@
-$currentPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-Write-Verbose -Message "CurrentPath: $currentPath"
+Import-Module -Name (Join-Path -Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) `
+                               -ChildPath 'xSQLServerHelper.psm1') `
+                               -Force
+<#
+    .SYNOPSIS
+    This function gets the owner of the desired sql database.
 
-# Load Common Code
-Import-Module $currentPath\..\..\xSQLServerHelper.psm1 -Verbose:$false -ErrorAction Stop
+    .PARAMETER Database
+    The name of database to be configured.
 
-# DSC resource to manage SQL database roles
+    .PARAMETER Name
+    The name of the login that will become a owner of the desired sql database.
 
-# NOTE: This resource requires WMF5 and PsDscRunAsCredential
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
 
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+#>
 function Get-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Collections.Hashtable])]
     param
     (
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $SQLServer = $env:COMPUTERNAME,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER"
+        $SQLInstanceName = 'MSSQLSERVER'
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    Write-Verbose -Message "Getting owner of database $Database"
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
 
-    if($SQL)
+    if ($sqlServerObject)
     {
         # Check database exists
-        if(!($SQLDatabase = $SQL.Databases[$Database]))
+        if ( -not ($sqlDatabaseObject = $sqlServerObject.Databases[$Database]) )
         {
-            throw New-TerminatingError -ErrorType NoDatabase -FormatArgs @($Database,$SQLServer,$SQLInstanceName) -ErrorCategory InvalidResult
+            throw New-TerminatingError -ErrorType NoDatabase `
+                                       -FormatArgs @($Database, $SQLServer, $SQLInstanceName) `
+                                       -ErrorCategory ObjectNotFound
         }
 
-        $Name = $SQLDatabase.Owner
-    }
-    else
-    {
-        $Name = $null
+        try
+        {
+            $sqlDatabaseOwner = $sqlDatabaseObject.Owner
+            New-VerboseMessage -Message "Owner for SQL Database name $Database is $sqlDatabaseOwner"
+        }
+        catch
+        {
+            throw New-TerminatingError -ErrorType FailedToGetOwnerDatabase `
+                                       -FormatArgs @($Database, $SQLServer, $SQLInstanceName) `
+                                       -ErrorCategory InvalidOperation
+        }
     }
 
     $returnValue = @{
-        Database = $Database
-        Name = $Name
-        SQLServer = $SQLServer
+        Database        = $Database
+        Name            = $sqlDatabaseOwner
+        SQLServer       = $SQLServer
         SQLInstanceName = $SQLInstanceName
     }
 
     $returnValue
 }
 
+<#
+    .SYNOPSIS
+    This function sets the owner of the desired sql database.
 
+    .PARAMETER Database
+    The name of database to be configured.
+
+    .PARAMETER Name
+    The name of the login that will become a owner of the desired sql database.
+
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
+
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+#>
 function Set-TargetResource
 {
     [CmdletBinding()]
     param
     (
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $SQLServer = $env:COMPUTERNAME,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER"
+        $SQLInstanceName = 'MSSQLSERVER'
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    Write-Verbose -Message "Setting owner $Name of database $Database"
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
 
-    if($SQL)
+    if($sqlServerObject)
     {
-        $SQLDatabase = $SQL.Databases[$Database]
-        $SQLDatabase.SetOwner($Name)
-    }
+        # Check database exists
+        if ( -not ($sqlDatabaseObject = $sqlServerObject.Databases[$Database]) )
+        {
+            throw New-TerminatingError -ErrorType NoDatabase -FormatArgs @($Database, $SQLServer, $SQLInstanceName) -ErrorCategory ObjectNotFound
+        }
 
-    if(!(Test-TargetResource @PSBoundParameters))
-    {
-        throw New-TerminatingError -ErrorType TestFailedAfterSet -ErrorCategory InvalidResult
+        # Check login exists
+        if ( -not ($sqlServerObject.Logins[$Name]) )
+        {
+            throw New-TerminatingError -ErrorType LoginNotFound -FormatArgs @($Name, $SQLServer, $SQLInstanceName) -ErrorCategory ObjectNotFound
+        }
+        
+        try
+        {
+            $sqlDatabaseObject.SetOwner($Name)
+            New-VerboseMessage -Message "Owner of SQL Database name $Database is now $Name"
+        }
+        catch
+        {
+            throw New-TerminatingError -ErrorType FailedToSetOwnerDatabase `
+                                       -FormatArgs @($Name, $Database, $SQLServer, $SQLInstanceName) `
+                                       -ErrorCategory InvalidOperation `
+                                       -InnerException $_.Exception
+        }
     }
 }
 
+<#
+    .SYNOPSIS
+    This function tests the owner of the desired sql database.
 
+    .PARAMETER Database
+    The name of database to be configured.
+
+    .PARAMETER Name
+    The name of the login that will become a owner of the desired sql database.
+
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
+
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+#>
 function Test-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Boolean])]
     param
     (
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Database,
 
-        [parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $Name,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $SQLServer = $env:COMPUTERNAME,
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName = "MSSQLSERVER"
+        $SQLInstanceName = 'MSSQLSERVER'
     )
 
-    $result = ((Get-TargetResource @PSBoundParameters).Name -eq $Name)
-    
-    $result
+    Write-Verbose -Message "Testing owner $Name of database $Database"
+     
+    $currentValues = Get-TargetResource @PSBoundParameters
+    return Test-SQLDscParameterState -CurrentValues $CurrentValues `
+                                     -DesiredValues $PSBoundParameters `
+                                     -ValuesToCheck @('Name', 'Database')
 }
-
 
 Export-ModuleMember -Function *-TargetResource

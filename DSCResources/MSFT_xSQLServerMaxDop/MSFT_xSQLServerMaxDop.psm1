@@ -1,227 +1,282 @@
-$currentPath = Split-Path -Parent $MyInvocation.MyCommand.Path
-Write-Verbose -Message "CurrentPath: $currentPath"
+Import-Module -Name (Join-Path -Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) `
+                               -ChildPath 'xSQLServerHelper.psm1') `
+                               -Force
+<#
+    .SYNOPSIS
+    This function gets the max degree of parallelism server configuration option.
 
-# Load Common Code
-Import-Module $currentPath\..\..\xSQLServerHelper.psm1 -Verbose:$false -ErrorAction Stop
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
 
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+#>
 function Get-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Collections.Hashtable])]
     param
     (
-        [ValidateSet("Present","Absent")]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $Ensure,
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
-        [System.Boolean]
-        $DynamicAlloc,
-
-        [System.Int32]
-        $MaxDop,
-
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLServer = $env:COMPUTERNAME,
-
-        [System.String]
-        $SQLInstanceName= "MSSQLSERVER"
+        $SQLServer = $env:COMPUTERNAME
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
 
-    if($SQL)
+    if ($sqlServerObject)
     {
-        $GetMaxDop = $sql.Configuration.MaxDegreeOfParallelism.ConfigValue
-        If($GetMaxDop)
-        {
-             New-VerboseMessage -Message "MaxDop is $GetMaxDop"
-        }
-        Switch ($Ensure)
-        {
-            "Present"
-            {
-                if ($GetMaxDop -eq 0)
-                {$EnsureResult = $false}
-                else
-                {$EnsureResult = $true}
-            }
-            "Absent"
-            {
-                if ($GetMaxDop -eq 0)
-                {$EnsureResult = $true}
-                else
-                {$EnsureResult =$false}
-            }
+        Write-Verbose -Message 'Getting the max degree of parallelism server configuration option'
+        $currentMaxDop = $sqlServerObject.Configuration.MaxDegreeOfParallelism.ConfigValue
     }
 
     $returnValue = @{
-            Ensure = $EnsureResult
-            DynamicAlloc =$DynamicAlloc
-            MaxDop = $GetMaxDop 
-            }
+        SQLInstanceName = $SQLInstanceName
+        SQLServer       = $SQLServer
+        MaxDop          = $currentMaxDop
+    }
+
     $returnValue
 }
-}
 
+<#
+    .SYNOPSIS
+    This function sets the max degree of parallelism server configuration option.
 
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
+
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+
+    .PARAMETER Ensure
+    When set to 'Present' then max degree of parallelism will be set to either the value in parameter MaxDop or dynamically configured when parameter DynamicAlloc is set to $true. 
+    When set to 'Absent' max degree of parallelism will be set to 0 which means no limit in number of processors used in parallel plan execution.
+
+    .PARAMETER DynamicAlloc
+    If set to $true then max degree of parallelism will be dynamically configured.
+    When this is set parameter is set to $true, the parameter MaxDop must be set to $null or not be configured.
+
+    .PARAMETER MaxDop
+    A numeric value to limit the number of processors used in parallel plan execution.
+#>
 function Set-TargetResource
 {
     [CmdletBinding()]
     param
     (
-        [ValidateSet("Present","Absent")]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $Ensure,
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
-        [System.Boolean]
-        $DynamicAlloc,
-
-        [System.Int32]
-        $MaxDop,
-
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $SQLServer = $env:COMPUTERNAME,
 
+        [Parameter()]
+        [ValidateSet('Present','Absent')]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName= "MSSQLSERVER"
+        $Ensure = 'Present',
+
+        [Parameter()]
+        [System.Boolean]
+        $DynamicAlloc,
+
+        [Parameter()]
+        [System.Int32]
+        $MaxDop
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
-    }
+    $sqlServerObject = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
 
-    if($SQL)
+    if ($sqlServerObject)
     {
-        
-        switch($Ensure)
+        Write-Verbose -Message 'Setting the max degree of parallelism server configuration option'
+        switch ($Ensure)
         {
-            "Present"
+            'Present'
             {
-                If($DynamicAlloc -eq $True)
+                if ($DynamicAlloc)
                 {
-                    $NumCores = $SQL.Processors
-                    $NumProcs = ($sql.AffinityInfo.NumaNodes | Measure-Object).Count
-                    if ($NumProcs -eq 1) 
+                    if ($MaxDop)
                     {
-                        $MaxDop =  ($NumCores /2)
-                        $MaxDop=[math]::round( $MaxDop,[system.midpointrounding]::AwayFromZero)
+                        throw New-TerminatingError -ErrorType MaxDopParamMustBeNull `
+                                                   -FormatArgs @( $SQLServer,$SQLInstanceName ) `
+                                                   -ErrorCategory InvalidArgument  
                     }
-                    elseif ($NumCores -ge 8) 
-                    {
-                        $MaxDop = 8
-                    }
-                    else
-                    {
-                        $MaxDop = $NumCores
-                    }
-                } 
-            }
-                
-            "Absent"
-            {
-                $MaxDop = 0
-            }
 
+                    $targetMaxDop = Get-SqlDscDynamicMaxDop -SqlServerObject $sqlServerObject
+                    New-VerboseMessage -Message "Dynamic MaxDop is $targetMaxDop."
+                }
+                else
+                {
+                    $targetMaxDop = $MaxDop
+                }
             }
+            
+            'Absent'
+            {
+                $targetMaxDop = 0
+                New-VerboseMessage -Message 'Desired state should be absent - MAXDOP is reset to the default value.'
+            }
+        }
 
-            try
-            {
-                $sql.Configuration.MaxDegreeOfParallelism.ConfigValue =$MaxDop
-                $sql.alter()
-                New-VerboseMessage -Message "Set MaxDop to $MaxDop"
-            }
-            catch
-            {
-                New-VerboseMessage -Message "Failed setting MaxDop to $MaxDop"
-            }
+        try
+        {
+            $sqlServerObject.Configuration.MaxDegreeOfParallelism.ConfigValue = $targetMaxDop
+            $sqlServerObject.Alter()
+            New-VerboseMessage -Message "Setting MAXDOP value to $targetMaxDop."
+        }
+        catch
+        {
+            throw New-TerminatingError -ErrorType MaxDopSetError `
+                                       -FormatArgs @($SQLServer,$SQLInstanceName,$targetMaxDop) `
+                                       -ErrorCategory InvalidOperation `
+                                       -InnerException $_.Exception
+        }
     }
 }
 
+<#
+    .SYNOPSIS
+    This function tests the max degree of parallelism server configuration option.
 
+    .PARAMETER SQLServer
+    The host name of the SQL Server to be configured.
+
+    .PARAMETER SQLInstanceName
+    The name of the SQL instance to be configured.
+
+    .PARAMETER Ensure
+    When set to 'Present' then max degree of parallelism will be set to either the value in parameter MaxDop or dynamically configured when parameter DynamicAlloc is set to $true. 
+    When set to 'Absent' max degree of parallelism will be set to 0 which means no limit in number of processors used in parallel plan execution.
+
+    .PARAMETER DynamicAlloc
+    If set to $true then max degree of parallelism will be dynamically configured.
+    When this is set parameter is set to $true, the parameter MaxDop must be set to $null or not be configured.
+
+    .PARAMETER MaxDop
+    A numeric value to limit the number of processors used in parallel plan execution.
+#>
 function Test-TargetResource
 {
     [CmdletBinding()]
     [OutputType([System.Boolean])]
     param
     (
-        [ValidateSet("Present","Absent")]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $Ensure,
+        $SQLInstanceName,
 
-        [parameter(Mandatory = $true)]
-        [System.Boolean]
-        $DynamicAlloc,
-
-        [System.Int32]
-        $MaxDop,
-
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
         [System.String]
         $SQLServer = $env:COMPUTERNAME,
 
+        [Parameter()]
+        [ValidateSet('Present','Absent')]
+        [ValidateNotNullOrEmpty()]
         [System.String]
-        $SQLInstanceName= "MSSQLSERVER"
+        $Ensure = 'Present',
+
+        [Parameter()]
+        [System.Boolean]
+        $DynamicAlloc,
+
+        [Parameter()]
+        [System.Int32]
+        $MaxDop
     )
 
-    if(!$SQL)
-    {
-        $SQL = Connect-SQL -SQLServer $SQLServer -SQLInstanceName $SQLInstanceName
+    Write-Verbose -Message 'Testing the max degree of parallelism server configuration option'
+     
+    $parameters = @{
+        SQLInstanceName = $PSBoundParameters.SQLInstanceName
+        SQLServer       = $PSBoundParameters.SQLServer
     }
     
-    $GetMaxDop = $SQL.Configuration.MaxDegreeOfParallelism.ConfigValue
-    switch($Ensure)
+    $currentValues = Get-TargetResource @parameters    
+    $getMaxDop = $currentValues.MaxDop
+    $isMaxDopInDesiredState = $true
+
+    switch ($Ensure)
     {
-        "Present"
+        'Absent'
         {
-            If ($DynamicAlloc)
+            if ($getMaxDop -ne 0)
             {
-                
-                If ($GetMaxDop -eq 0)
-                {
-                    New-VerboseMessage -Message "Current MaxDop is $GetMaxDop should be updated to $MaxDop"
-                    return $false
-                }
-                else 
-                {
-                    New-VerboseMessage -Message "Current MaxDop is configured at $GetMaxDop."
-                    return $True
-                }
-            }
-            else
-            {
-                If ($GetMaxDop -eq $MaxDop)
-                {
-                    New-VerboseMessage -Message "Current MaxDop is at Requested value. Do nothing." 
-                    return $true
-                }
-                else 
-                {
-                    New-VerboseMessage -Message "Current MaxDop is $GetMaxDop should be updated to $MaxDop"
-                    return $False
-                }
+                New-VerboseMessage -Message "Current MaxDop is $getMaxDop should be updated to 0"
+                $isMaxDopInDesiredState = $false
             }
         }
-        "Absent" 
+        'Present'
         {
-            If ($GetMaxDop -eq 0)
+            if ($DynamicAlloc)
             {
-                New-VerboseMessage -Message "Current MaxDop is at Requested value. Do nothing." 
-                return $true
+                if ($MaxDop)
+                {
+                    throw New-TerminatingError -ErrorType MaxDopParamMustBeNull `
+                                               -FormatArgs @( $SQLServer,$SQLInstanceName ) `
+                                               -ErrorCategory InvalidArgument  
+                }
+
+                $dynamicMaxDop = Get-SqlDscDynamicMaxDop
+                New-VerboseMessage -Message "Dynamic MaxDop is $dynamicMaxDop."
+
+                if ($getMaxDop -ne $dynamicMaxDop)
+                {
+                    New-VerboseMessage -Message "Current MaxDop is $getMaxDop should be updated to $dynamicMaxDop"
+                    $isMaxDopInDesiredState = $false
+                }
             }
             else 
             {
-                New-VerboseMessage -Message "Current MaxDop is $GetMaxDop should be updated"
-                return $False
+                if ($getMaxDop -ne $MaxDop)
+                {
+                    New-VerboseMessage -Message "Current MaxDop is $getMaxDop should be updated to $MaxDop"
+                    $isMaxDopInDesiredState = $false
+                }
             }
         }
     }
+
+    $isMaxDopInDesiredState 
 }
 
+<#
+    .SYNOPSIS
+    This cmdlet is used to return the dynamic max degree of parallelism
+#>
+function Get-SqlDscDynamicMaxDop
+{
+    $cimInstanceProc = Get-CimInstance -ClassName Win32_Processor
+    $numProcs = (Measure-Object -InputObject $cimInstanceProc -Property NumberOfLogicalProcessors -Sum).Sum
+    $numCores = (Measure-Object -InputObject $cimInstanceProc -Property NumberOfCores -Sum).Sum
+
+    if ($numProcs -eq 1)
+    {
+        $dynamicMaxDop = [Math]::Round($numCores / 2, [System.MidpointRounding]::AwayFromZero)
+    }
+    elseif ($numCores -ge 8)
+    {
+        $dynamicMaxDop = 8
+    }
+    else
+    {
+        $dynamicMaxDop = $numCores
+    }
+
+    $dynamicMaxDop
+}
 
 Export-ModuleMember -Function *-TargetResource
-
